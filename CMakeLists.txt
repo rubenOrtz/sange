@@ -10,8 +10,8 @@ endif()
 include_directories(${CMAKE_JS_INC})
 include_directories(${NODE_ADDON_INC})
 
-if(${CMAKE_BUILD_TYPE} STREQUAL "Debug")
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSANGE_DEBUG")
+if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSANGE_DEBUG")
 endif()
 
 add_library(sange SHARED
