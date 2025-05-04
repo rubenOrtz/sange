@@ -115,7 +115,7 @@ int Player::init_pipeline() {
 
     // Configurar audio de salida
     audio_out.ch_layout = decoderctx->ch_layout;
-    audio_out.channels = av_channel_layout_nb_channels(&decoderctx->ch_layout);
+    audio_out.channels = av_channel_layout_check(&decoderctx->ch_layout);
     audio_out.sample_rate = decoderctx->sample_rate;
 
     // Configurar codificador
@@ -130,7 +130,7 @@ int Player::init_pipeline() {
 
     // Configurar audio de entrada
     audio_in.ch_layout = decoderctx->ch_layout;
-    audio_in.channels = av_channel_layout_nb_channels(&decoderctx->ch_layout);
+    audio_in.channels = av_channel_layout_check(&decoderctx->ch_layout);
     audio_in.sample_rate = decoderctx->sample_rate;
     audio_in.fmt = decoderctx->sample_fmt;
 
@@ -170,7 +170,7 @@ int Player::configure_filters(){
 		return AVERROR(ENOMEM);
 	filter_graph -> nb_threads = 1;
 
-	int64_t channel_layouts[] = {audio_out.channel_layout, -1};
+	AVChannelLayout channel_layouts[] = {audio_out.ch_layout};
 	int sample_rates[] = {audio_out.sample_rate, -1};
 	int channels[] = {audio_out.channels, -1};
 	int sample_fmts[] = {audio_out.fmt, -1};
@@ -178,7 +178,7 @@ int Player::configure_filters(){
 	char filter_args[256];
 
 	snprintf(filter_args, sizeof(filter_args), "sample_rate=%d:sample_fmt=%d:channels=%d:channel_layout=0x%" PRIx64,
-												audio_in.sample_rate, audio_in.fmt, audio_in.channels, audio_in.channel_layout);
+												audio_in.sample_rate, audio_in.fmt, audio_in.channels, audio_in.ch_layout);
 	int ret;
 
 	if((ret = avfilter_graph_create_filter(&filter_src, avfilter_get_by_name("abuffer"), nullptr, filter_args, nullptr, filter_graph)) < 0)
@@ -268,155 +268,157 @@ int Player::configure_filters(){
 }
 
 int Player::read_packet(){
-	int err;
+    int err;
 
-	while(!b_stop){
-		if(encoder_has_data){
-			err = avcodec_receive_packet(encoderctx, packet);
+    while(!b_stop){
+        if(encoder_has_data){
+            err = avcodec_receive_packet(encoderctx, packet);
 
-			if(err == AVERROR(EAGAIN))
-				encoder_has_data = false;
-			else if(err)
-				return err;
-			else
-				break;
-		}
+            if(err == AVERROR(EAGAIN))
+                encoder_has_data = false;
+            else if(err)
+                return err;
+            else
+                break;
+        }
 
-		if(filter_has_data){
-			err = av_buffersink_get_frame(filter_sink, frame);
+        if(filter_has_data){
+            err = av_buffersink_get_frame(filter_sink, frame);
 
-			if(err == AVERROR(EAGAIN))
-				filter_has_data = false;
-			else if(err)
-				return err;
-			else{
-				err = avcodec_send_frame(encoderctx, frame);
+            if(err == AVERROR(EAGAIN))
+                filter_has_data = false;
+            else if(err)
+                return err;
+            else{
+                err = avcodec_send_frame(encoderctx, frame);
+                av_frame_unref(frame);
 
-				av_frame_unref(frame);
+                if(err) return err;
 
-				if(err) return err;
+                encoder_has_data = true;
+                continue;
+            }
+        }
 
-				encoder_has_data = true;
+        if(decoder_has_data){
+            err = avcodec_receive_frame(decoderctx, frame);
 
-				continue;
-			}
-		}
+            if(err == AVERROR(EAGAIN))
+                decoder_has_data = false;
+            else if(err)
+                return err;
+            else{
+                AVRational tb = {1, frame->sample_rate};
 
-		if(decoder_has_data){
-			err = avcodec_receive_frame(decoderctx, frame);
+                if(frame->pts != AV_NOPTS_VALUE)
+                    frame->pts = av_rescale_q(frame->pts, decoderctx->pkt_timebase, tb);
+                else if(last_pts != AV_NOPTS_VALUE)
+                    frame->pts = av_rescale_q(last_pts, last_tb, tb);
 
-			if(err == AVERROR(EAGAIN))
-				decoder_has_data = false;
-			else if(err)
-				return err;
-			else{
-				AVRational tb = {1, frame -> sample_rate};
+                if(frame->pts != AV_NOPTS_VALUE){
+                    last_pts = frame->pts + frame->nb_samples;
+                    last_tb = tb;
+                }
 
-				if(frame -> pts != AV_NOPTS_VALUE)
-					frame -> pts = av_rescale_q(frame -> pts, decoderctx -> pkt_timebase, tb);
-				else if(last_pts != AV_NOPTS_VALUE)
-					frame -> pts = av_rescale_q(last_pts, last_tb, tb);
-				if(frame -> pts != AV_NOPTS_VALUE){
-					last_pts = frame -> pts + frame -> nb_samples;
-					last_tb = tb;
-				}
+                bool channel_fmt_neq = false;
+                int frame_channels = frame->ch_layout.nb_channels;
 
-				bool channel_fmt_neq = false;
+                if(frame_channels != audio_in.channels){
+                    channel_fmt_neq = true;
+                }else if(audio_in.channels == 1){
+                    if(av_get_packed_sample_fmt((AVSampleFormat)frame->format) != av_get_packed_sample_fmt((AVSampleFormat)audio_in.fmt))
+                        channel_fmt_neq = true;
+                }else if(frame->format != audio_in.fmt){
+                    channel_fmt_neq = true;
+                }
 
-				if(frame -> channels != audio_in.channels){
-					channel_fmt_neq = true;
-				}else if(audio_in.channels == 1){
-					if(av_get_packed_sample_fmt((AVSampleFormat)frame -> format) != av_get_packed_sample_fmt((AVSampleFormat)audio_in.fmt))
-						channel_fmt_neq = true;
-				}else if(frame -> format != audio_in.fmt){
-					channel_fmt_neq = true;
-				}
+                if(
+                    channel_fmt_neq ||
+                    frame->sample_rate != audio_in.sample_rate ||
+                    !av_channel_layout_compare(&frame->ch_layout, &audio_in.ch_layout) ||
+                    filters_neq()
+                ){
+                    audio_in.fmt = frame->format;
+                    audio_in.channels = frame_channels;
+                    av_channel_layout_copy(&audio_in.ch_layout, &frame->ch_layout);
+                    audio_in.sample_rate = frame->sample_rate;
 
-				if(channel_fmt_neq || frame -> sample_rate != audio_in.sample_rate || frame -> ch_layout != audio_in.ch_layout || filters_neq()){
-					audio_in.fmt = frame -> format;
-					audio_in.channels = frame -> channels;
-					audio_in.ch_layout = frame -> ch_layout;
-					audio_in.sample_rate = frame -> sample_rate;
+                    filters_seteq();
 
-					filters_seteq();
+                    err = configure_filters();
+                    if(err)
+                        return err;
+                }
 
-					err = configure_filters();
+                if(filter_graph){
+                    err = av_buffersrc_add_frame(filter_src, frame);
+                    filter_has_data = true;
+                }else{
+                    err = avcodec_send_frame(encoderctx, frame);
+                    encoder_has_data = true;
 
-					if(err)
-						return err;
-				}
+                    if(!err)
+                        av_frame_unref(frame);
+                }
 
-				if(filter_graph){
-					err = av_buffersrc_add_frame(filter_src, frame);
-					filter_has_data = true;
-				}else{
-					err = avcodec_send_frame(encoderctx, frame);
-					encoder_has_data = true;
+                if(err){
+                    av_frame_unref(frame);
+                    return err;
+                }
 
-					if(!err)
-						av_frame_unref(frame);
-				}
+                continue;
+            }
+        }
 
-				if(err){
-					av_frame_unref(frame);
+        err = av_read_frame(format_ctx, packet);
+        if(err) return err;
 
-					return err;
-				}
+        time = (double)packet->pts / stream->time_base.den;
+        time -= time_start;
 
-				continue;
-			}
-		}
+        bool destroy_pipeline = false;
 
-		err = av_read_frame(format_ctx, packet);
+        if(filters_set()){
+            if(!pipeline && (err = init_pipeline()) < 0)
+                return err;
+        }else{
+            if(pipeline && stream->codecpar->codec_id == encoder_id)
+                destroy_pipeline = true;
+        }
 
-		if(err) return err;
+        if(!pipeline || destroy_pipeline){
+            if(encoder_id == AV_CODEC_ID_OPUS){
+                int sample_rate = 48000; // Opus is always 48KHz
+                int channels = opus_packet_get_nb_channels(packet->data);
+                int samples = opus_packet_get_samples_per_frame(packet->data, sample_rate);
 
-		time = (double)packet -> pts / stream -> time_base.den;
-		time -= time_start;
+                if(samples == OPUS_INVALID_PACKET)
+                    return AVERROR_INVALIDDATA;
 
-		bool destroy_pipeline = false;
+                if(channels == audio_out.channels && sample_rate == audio_out.sample_rate)
+                    packet->duration = samples;
+                else{
+                    destroy_pipeline = false;
+                    if(!pipeline && (err = init_pipeline()) < 0)
+                        return err;
+                }
+            }
 
-		if(filters_set()){
-			if(!pipeline && (err = init_pipeline()) < 0)
-				return err;
-		}else{
-			if(pipeline && stream -> codecpar -> codec_id == encoder_id)
-				destroy_pipeline = true;
-		}
+            if(destroy_pipeline)
+                pipeline_destroy();
+            if(!pipeline)
+                break;
+        }
 
-		if(!pipeline || destroy_pipeline){
-			if(encoder_id == AV_CODEC_ID_OPUS){
-				int sample_rate = 48000, /* opus is always 48KHz */
-					channels = opus_packet_get_nb_channels(packet -> data),
-					samples = opus_packet_get_samples_per_frame(packet -> data, sample_rate);
-				if(samples == OPUS_INVALID_PACKET)
-					return AVERROR_INVALIDDATA;
-				if(channels == audio_out.channels && sample_rate == audio_out.sample_rate)
-					packet -> duration = samples;
-				else{
-					destroy_pipeline = false;
+        err = avcodec_send_packet(decoderctx, packet);
+        av_packet_unref(packet);
 
-					if(!pipeline && (err = init_pipeline()) < 0)
-						return err;
-				}
-			}
+        if(err) return err;
 
-			if(destroy_pipeline)
-				pipeline_destroy();
-			if(!pipeline)
-				break;
-		}
+        decoder_has_data = true;
+    }
 
-		err = avcodec_send_packet(decoderctx, packet);
-
-		av_packet_unref(packet);
-
-		if(err) return err;
-
-		decoder_has_data = true;
-	}
-
-	return 0;
+    return 0;
 }
 
 void Player::run(){
