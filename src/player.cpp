@@ -2,6 +2,9 @@
 #include <unistd.h>
 #include <opus/opus.h>
 #include "player.h"
+extern "C" {
+    #include <libavutil/channel_layout.h>
+}
 
 void PlayerContext::add(Player* player){
 	mutex.lock();
@@ -89,57 +92,60 @@ void Player::filters_seteq(){
 	equalizer.reset_change();
 }
 
-int Player::init_pipeline(){
-	int err;
+int Player::init_pipeline() {
+    int err = 0;
 
-	decoderctx = avcodec_alloc_context3(nullptr);
-	encoderctx = avcodec_alloc_context3(nullptr);
+    decoderctx = avcodec_alloc_context3(nullptr);
+    encoderctx = avcodec_alloc_context3(nullptr);
 
-	if(!decoderctx || !encoderctx){
-		err = AVERROR(ENOMEM);
+    if (!decoderctx || !encoderctx) {
+        err = AVERROR(ENOMEM);
+        goto end;
+    }
 
-		goto end;
-	}
+    if ((err = avcodec_parameters_to_context(decoderctx, stream->codecpar)) < 0)
+        goto end;
 
-	if((err = avcodec_parameters_to_context(decoderctx, stream -> codecpar)) < 0)
-		goto end;
-	decoderctx -> pkt_timebase = stream -> time_base;
-	decoder = avcodec_find_decoder(decoderctx -> codec_id);
-	decoderctx -> request_sample_fmt = AV_SAMPLE_FMT_S16;
+    decoderctx->pkt_timebase = stream->time_base;
+    decoder = avcodec_find_decoder(decoderctx->codec_id);
+    decoderctx->request_sample_fmt = AV_SAMPLE_FMT_S16;
 
-	if((err = avcodec_open2(decoderctx, decoder, nullptr)) < 0)
-		goto end;
-	audio_out.channel_layout = av_get_default_channel_layout(audio_out.channels);
+    if ((err = avcodec_open2(decoderctx, decoder, nullptr)) < 0)
+        goto end;
 
-	encoderctx -> bit_rate = bitrate;
-	encoderctx -> sample_rate = audio_out.sample_rate;
-	encoderctx -> channels = audio_out.channels;
-	encoderctx -> sample_fmt = AV_SAMPLE_FMT_FLT;
-	encoderctx -> channel_layout = audio_out.channel_layout;
-	encoderctx -> compression_level = 10;
+    // Configurar audio de salida
+    audio_out.ch_layout = decoderctx->ch_layout;
+    audio_out.channels = av_channel_layout_nb_channels(&decoderctx->ch_layout);
+    audio_out.sample_rate = decoderctx->sample_rate;
 
-	if((err = avcodec_open2(encoderctx, encoder, nullptr)) < 0)
-		goto end;
-	audio_in.channels = decoderctx -> channels;
-	audio_in.sample_rate = decoderctx -> sample_rate;
-	audio_in.fmt = decoderctx -> sample_fmt;
-	audio_in.channel_layout = 0;
+    // Configurar codificador
+    encoderctx->bit_rate = bitrate;
+    encoderctx->sample_rate = audio_out.sample_rate;
+    encoderctx->sample_fmt = AV_SAMPLE_FMT_FLT;
+    encoderctx->compression_level = 10;
+    encoderctx->ch_layout = audio_out.ch_layout;
 
-	audio_out.fmt = encoderctx -> sample_fmt;
+    if ((err = avcodec_open2(encoderctx, encoder, nullptr)) < 0)
+        goto end;
 
-	last_pts = AV_NOPTS_VALUE;
-	last_tb = {0, 1};
+    // Configurar audio de entrada
+    audio_in.ch_layout = decoderctx->ch_layout;
+    audio_in.channels = av_channel_layout_nb_channels(&decoderctx->ch_layout);
+    audio_in.sample_rate = decoderctx->sample_rate;
+    audio_in.fmt = decoderctx->sample_fmt;
 
-	pipeline = true;
+    audio_out.fmt = encoderctx->sample_fmt;
 
-	return 0;
+    last_pts = AV_NOPTS_VALUE;
+    last_tb = {0, 1};
+    pipeline = true;
 
-	end:
+    return 0;
 
-	avcodec_free_context(&decoderctx);
-	avcodec_free_context(&encoderctx);
-
-	return err;
+end:
+    avcodec_free_context(&decoderctx);
+    avcodec_free_context(&encoderctx);
+    return err;
 }
 
 void Player::pipeline_destroy(){
@@ -326,10 +332,10 @@ int Player::read_packet(){
 					channel_fmt_neq = true;
 				}
 
-				if(channel_fmt_neq || frame -> sample_rate != audio_in.sample_rate || frame -> channel_layout != audio_in.channel_layout || filters_neq()){
+				if(channel_fmt_neq || frame -> sample_rate != audio_in.sample_rate || frame -> ch_layout != audio_in.ch_layout || filters_neq()){
 					audio_in.fmt = frame -> format;
 					audio_in.channels = frame -> channels;
-					audio_in.channel_layout = frame -> channel_layout;
+					audio_in.ch_layout = frame -> ch_layout;
 					audio_in.sample_rate = frame -> sample_rate;
 
 					filters_seteq();
